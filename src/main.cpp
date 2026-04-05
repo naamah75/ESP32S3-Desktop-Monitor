@@ -3,41 +3,53 @@
  * PlatformIO conversion.
  *
  * Receives per-pixel updates (x, y, RGB565) over TCP and applies them.
- * Protocol v3 (little-endian):
- *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x03) + frame_id (uint32 LE) + count (uint16)
- *   Body:   count entries of: x (uint8), y (uint16 LE), color (uint16 LE)
+ * Protocol v4 (little-endian):
+ *   Header: 'P' 'X' 'U' 'P' (4 bytes) + version (1 byte, 0x04) + frame_id (uint32 LE) + count (uint16)
+ *   Body:   count entries of: x (uint16 LE), y (uint16 LE), color (uint16 LE)
  */
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <WiFiServer.h>
 #include <esp_heap_caps.h>
 
-TFT_eSPI tft = TFT_eSPI();
+#include "WaitingLogo.h"
 
-#if (DISPLAY_ROTATION == 1) || (DISPLAY_ROTATION == 3)
-constexpr uint16_t DISPLAY_WIDTH = TFT_HEIGHT;
-constexpr uint16_t DISPLAY_HEIGHT = TFT_WIDTH;
-#else
-constexpr uint16_t DISPLAY_WIDTH = TFT_WIDTH;
-constexpr uint16_t DISPLAY_HEIGHT = TFT_HEIGHT;
-#endif
+TFT_eSPI tft = TFT_eSPI();
+uint8_t currentRotation = DISPLAY_ROTATION;
+uint16_t displayWidth = TFT_WIDTH;
+uint16_t displayHeight = TFT_HEIGHT;
 
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
+const char* WIFI_PLACEHOLDER_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PLACEHOLDER_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* CONFIG_AP_NAME = "ESP32S3-Monitor-Setup";
+const char* CONFIG_PORTAL_IP = "192.168.4.1";
 
 WiFiServer server(8090);
 WiFiClient client;
 
+const char* MDNS_HOSTNAME = "esp32s3-monitor";
+const char* MDNS_SERVICE = "desktopmonitor";
+const char* MDNS_PROTOCOL = "tcp";
+
 const uint8_t MAGIC[4] = {'P', 'X', 'U', 'P'};
-const uint8_t PROTO_VERSION = 0x03;
+const uint8_t PROTO_VERSION = 0x04;
 const size_t HEADER_SIZE = 11;
 const uint8_t MAGIC_RUN[4] = {'P', 'X', 'U', 'R'};
 const uint8_t RUN_VERSION = 0x02;
 const size_t RUN_HEADER_SIZE = 11;
+const uint8_t MAGIC_ORIENTATION[4] = {'P', 'X', 'O', 'R'};
+const uint8_t ORIENTATION_VERSION = 0x01;
 
 bool swapBytesSetting = false;
+bool clientActive = false;
+unsigned long lastClientActivity = 0;
+const unsigned long CLIENT_IDLE_TIMEOUT_MS = 3000;
 
 unsigned long frameCount = 0;
 unsigned long lastStats = 0;
@@ -45,9 +57,9 @@ unsigned long updatesApplied = 0;
 uint32_t lastFrameId = 0;
 
 struct PixelUpdate {
-  uint8_t x;
+  uint16_t x;
   uint16_t y;
-  uint8_t len;
+  uint16_t len;
   uint16_t color;
 };
 
@@ -95,62 +107,233 @@ void applyColorConfig() {
   tft.setSwapBytes(swapBytesSetting);
 }
 
+bool isLandscapeLayout() {
+  return displayWidth > displayHeight;
+}
+
+void updateDisplayMetrics() {
+  displayWidth = tft.width();
+  displayHeight = tft.height();
+}
+
+void setDisplayRotationRuntime(uint8_t rotation) {
+  currentRotation = rotation % 4;
+  tft.setRotation(currentRotation);
+  applyColorConfig();
+  updateDisplayMetrics();
+}
+
+void drawHeaderLogo() {
+  int16_t x = isLandscapeLayout() ? 12 : (displayWidth - WAITING_LOGO_WIDTH) / 2;
+  int16_t y = isLandscapeLayout() ? 20 : 14;
+  bool previousSwap = swapBytesSetting;
+  tft.setSwapBytes(true);
+  tft.pushImage(x, y, WAITING_LOGO_WIDTH, WAITING_LOGO_HEIGHT, waitingLogo);
+  tft.setSwapBytes(previousSwap);
+}
+
 void showWaitingScreen() {
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 20);
-  tft.setTextSize(2);
-  tft.println("Desktop");
-  tft.setCursor(10, 40);
-  tft.println("Monitor");
-  tft.setCursor(10, 50);
+  drawHeaderLogo();
   tft.setTextSize(1);
-  tft.println("Status:");
-  tft.setCursor(10, 62);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 30);
+  } else {
+    tft.setCursor(10, 154);
+  }
+  tft.println("STATUS:");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 44);
+  } else {
+    tft.setCursor(10, 168);
+  }
   tft.println("Waiting for client");
-  tft.setCursor(10, 82);
-  tft.println("IP Address:");
-  tft.setCursor(10, 96);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 74);
+  } else {
+    tft.setCursor(10, 196);
+  }
+  tft.println("IP ADDRESS:");
   tft.setTextSize(2);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 90);
+  } else {
+    tft.setCursor(10, 212);
+  }
   tft.println(WiFi.localIP().toString());
 }
 
 void showBootLogo() {
   tft.fillScreen(TFT_BLACK);
-  tft.fillRoundRect(16, 24, DISPLAY_WIDTH - 32, 74, 10, TFT_DARKCYAN);
-  tft.drawRoundRect(16, 24, DISPLAY_WIDTH - 32, 74, 10, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
-  tft.setTextSize(2);
-  tft.setCursor(34, 38);
-  tft.println("Desktop");
-  tft.setCursor(34, 62);
-  tft.println("Monitor");
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(28, 118);
-  tft.println("LilyGo T-Display-S3");
-  tft.setCursor(48, 134);
-  tft.print(DISPLAY_WIDTH);
-  tft.print('x');
-  tft.println(DISPLAY_HEIGHT);
+  drawHeaderLogo();
 }
 
 void showStatusScreen(const char* status, const String& detail = "") {
   showBootLogo();
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(16, 170);
-  tft.println("Status");
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 30);
+  } else {
+    tft.setCursor(16, 206);
+  }
+  tft.println("STATUS:");
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(2);
-  tft.setCursor(16, 186);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 46);
+  } else {
+    tft.setCursor(16, 222);
+  }
   tft.println(status);
   if (detail.length() > 0) {
     tft.setTextSize(1);
-    tft.setCursor(16, 214);
+    if (isLandscapeLayout()) {
+      tft.setCursor(154, 78);
+    } else {
+      tft.setCursor(16, 250);
+    }
     tft.println(detail);
   }
+}
+
+void showConfigPortalScreen() {
+  showBootLogo();
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 24);
+  } else {
+    tft.setCursor(16, 184);
+  }
+  tft.println("SETUP WIFI:");
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 40);
+  } else {
+    tft.setCursor(16, 200);
+  }
+  tft.println("Connect to AP:");
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 54);
+  } else {
+    tft.setCursor(16, 214);
+  }
+  tft.println(CONFIG_AP_NAME);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 76);
+  } else {
+    tft.setCursor(16, 238);
+  }
+  tft.println("Open:");
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  if (isLandscapeLayout()) {
+    tft.setCursor(154, 90);
+  } else {
+    tft.setCursor(16, 252);
+  }
+  tft.println(CONFIG_PORTAL_IP);
+}
+
+void dropClient(const char* message = nullptr) {
+  if (message != nullptr) {
+    Serial.println(message);
+  }
+  if (client) {
+    client.stop();
+  }
+  clientActive = false;
+  showWaitingScreen();
+}
+
+bool hasDefaultWifiConfig() {
+  return strlen(ssid) > 0 && strlen(password) > 0 &&
+         strcmp(ssid, WIFI_PLACEHOLDER_SSID) != 0 &&
+         strcmp(password, WIFI_PLACEHOLDER_PASSWORD) != 0;
+}
+
+bool shouldForceWifiSetup() {
+  if (FORCE_WIFI_SETUP) {
+    return true;
+  }
+  pinMode(SETUP_BUTTON_PIN, INPUT_PULLUP);
+  delay(10);
+  return digitalRead(SETUP_BUTTON_PIN) == LOW;
+}
+
+bool connectWithTimeout(const char* connectSsid, const char* connectPassword, int maxAttempts = 30) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(connectSsid, connectPassword);
+  for (int attempts = 0; WiFi.status() != WL_CONNECTED && attempts < maxAttempts; attempts++) {
+    delay(250);
+    Serial.print('.');
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool connectSavedWifi(int maxAttempts = 30) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();
+  for (int attempts = 0; WiFi.status() != WL_CONNECTED && attempts < maxAttempts; attempts++) {
+    delay(250);
+    Serial.print('.');
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool ensureWifiConnected() {
+  bool forceSetup = shouldForceWifiSetup();
+  if (forceSetup) {
+    Serial.println("WiFi setup forced by config/button");
+  }
+
+  if (!forceSetup && hasDefaultWifiConfig()) {
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(ssid);
+    showStatusScreen("Connecting", ssid);
+    if (connectWithTimeout(ssid, password)) {
+      return true;
+    }
+    Serial.println("\nWiFi fallback credentials failed");
+  }
+
+  if (!forceSetup) {
+    Serial.println("Trying saved WiFi credentials");
+    showStatusScreen("Connecting", "Saved network");
+    if (connectSavedWifi()) {
+      return true;
+    }
+    Serial.println("\nSaved WiFi credentials failed");
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(200);
+  showConfigPortalScreen();
+  Serial.print("Starting captive portal AP: ");
+  Serial.println(CONFIG_AP_NAME);
+  WiFiManager wm;
+  wm.setConfigPortalBlocking(true);
+  wm.setMinimumSignalQuality(5);
+  wm.setTitle("Desktop Monitor Setup");
+  if (forceSetup) {
+    Serial.println("Clearing saved WiFi settings before captive portal");
+    wm.resetSettings();
+    WiFi.disconnect(true, true);
+    delay(200);
+  }
+  bool connected = forceSetup ? wm.startConfigPortal(CONFIG_AP_NAME) : wm.autoConnect(CONFIG_AP_NAME);
+  if (!connected) {
+    Serial.println("Captive portal exited without WiFi connection");
+    return false;
+  }
+  Serial.println("Captive portal connected successfully");
+  return true;
 }
 
 void setup() {
@@ -165,26 +348,12 @@ void setup() {
 
   tft.init();
   dmaEnabled = false;
-  tft.setRotation(DISPLAY_ROTATION);
-  applyColorConfig();
+  setDisplayRotationRuntime(DISPLAY_ROTATION);
   showStatusScreen("Booting...");
 
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
-  showStatusScreen("Connecting", ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(250);
-    Serial.print('.');
-    attempts++;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
+  if (!ensureWifiConnected()) {
     Serial.println("\nWiFi connection failed");
-    showStatusScreen("WiFi FAIL", ssid);
+    showStatusScreen("WiFi FAIL", CONFIG_AP_NAME);
     while (true) {
       delay(1000);
     }
@@ -193,6 +362,15 @@ void setup() {
   Serial.println("\nWiFi connected");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
+
+  if (MDNS.begin(MDNS_HOSTNAME)) {
+    MDNS.addService(MDNS_SERVICE, MDNS_PROTOCOL, 8090);
+    Serial.print("mDNS ready: ");
+    Serial.print(MDNS_HOSTNAME);
+    Serial.println(".local");
+  } else {
+    Serial.println("mDNS start failed");
+  }
 
   showStatusScreen("WiFi OK", WiFi.localIP().toString());
   delay(600);
@@ -204,12 +382,19 @@ void setup() {
 }
 
 bool handleClient() {
+  if (clientActive && client && !client.connected()) {
+    dropClient("Client disconnected");
+    return false;
+  }
+
   if (!client || !client.connected()) {
     client = server.available();
     if (client) {
       Serial.println("Client connected");
       client.setNoDelay(true);
       client.setTimeout(50);
+      clientActive = true;
+      lastClientActivity = millis();
       frameCount = 0;
       updatesApplied = 0;
       showStatusScreen("Client OK", "Streaming active");
@@ -220,36 +405,60 @@ bool handleClient() {
     return false;
   }
 
-  if (client.available() < 11) {
+  unsigned long now = millis();
+  if (clientActive && client.available() == 0 && (now - lastClientActivity) > CLIENT_IDLE_TIMEOUT_MS) {
+    dropClient("Client idle timeout");
+    return false;
+  }
+
+  if (client.available() < 4) {
     return true;
   }
 
+  lastClientActivity = now;
+
   uint8_t magicBuf[4];
   if (!readExactly(client, magicBuf, 4)) {
-    client.stop();
+    dropClient("Client disconnected");
     return false;
   }
 
   bool isRun = (memcmp(magicBuf, MAGIC_RUN, 4) == 0);
   bool isPixel = (memcmp(magicBuf, MAGIC, 4) == 0);
+  bool isOrientation = (memcmp(magicBuf, MAGIC_ORIENTATION, 4) == 0);
 
-  if (!isRun && !isPixel) {
-    Serial.println("Bad magic; flushing stream");
-    client.stop();
+  if (!isRun && !isPixel && !isOrientation) {
+    dropClient("Bad magic; flushing stream");
     return false;
+  }
+
+  if (isOrientation) {
+    uint8_t config[2];
+    if (!readExactly(client, config, sizeof(config))) {
+      dropClient("Failed to read orientation packet; dropping client");
+      return false;
+    }
+    if (config[0] != ORIENTATION_VERSION) {
+      Serial.print("Unsupported orientation version: ");
+      Serial.println(config[0], HEX);
+      dropClient();
+      return false;
+    }
+    setDisplayRotationRuntime(config[1]);
+    showStatusScreen("Client OK", "Streaming active");
+    return true;
   }
 
   if (isPixel) {
     uint8_t rest[HEADER_SIZE - 4];
     if (!readExactly(client, rest, sizeof(rest))) {
-      Serial.println("Failed to read pixel header; dropping client");
-      client.stop();
+      dropClient("Failed to read pixel header; dropping client");
       return false;
     }
     if (rest[0] != PROTO_VERSION) {
       Serial.print("Unsupported pixel version: ");
       Serial.println(rest[0], HEX);
-      client.stop();
+      dropClient();
       return false;
     }
 
@@ -264,68 +473,65 @@ bool handleClient() {
       lastFrameId = frameId;
       return true;
     }
-    if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
+    if (count > (displayWidth * displayHeight)) {
       Serial.print("Update count too large: ");
       Serial.println(count);
-      client.stop();
+      dropClient();
       return false;
     }
 
     if (!ensureUpdateBuffer(count)) {
-      Serial.println("No buffer for updates; dropping client");
-      client.stop();
+      dropClient("No buffer for updates; dropping client");
       return false;
     }
 
-    uint8_t entry[5];
+    uint8_t entry[6];
     for (uint16_t i = 0; i < count; i++) {
       if (!readExactly(client, entry, sizeof(entry))) {
-        Serial.println("Stream ended mid-frame; dropping client");
-        client.stop();
+        dropClient("Stream ended mid-frame; dropping client");
         return false;
       }
-      updateBuffer[i].x = entry[0];
-      updateBuffer[i].y = entry[1] | (static_cast<uint16_t>(entry[2]) << 8);
-      updateBuffer[i].color = entry[3] | (static_cast<uint16_t>(entry[4]) << 8);
+      updateBuffer[i].x = entry[0] | (static_cast<uint16_t>(entry[1]) << 8);
+      updateBuffer[i].y = entry[2] | (static_cast<uint16_t>(entry[3]) << 8);
+      updateBuffer[i].color = entry[4] | (static_cast<uint16_t>(entry[5]) << 8);
     }
 
     tft.startWrite();
     for (uint16_t i = 0; i < count; i++) {
-      uint8_t x = updateBuffer[i].x;
-      uint8_t y = updateBuffer[i].y;
-      if (x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT) {
+      uint16_t x = updateBuffer[i].x;
+      uint16_t y = updateBuffer[i].y;
+      if (x < displayWidth && y < displayHeight) {
         tft.setAddrWindow(x, y, 1, 1);
-      tft.writeColor(updateBuffer[i].color, 1);
-      updatesApplied++;
-    }
+        tft.writeColor(updateBuffer[i].color, 1);
+        updatesApplied++;
+      }
     }
     tft.endWrite();
 
     frameCount++;
     lastFrameId = frameId;
-    unsigned long now = millis();
-    if (now - lastStats > 2000) {
+    unsigned long statsNow = millis();
+    if (statsNow - lastStats > 2000) {
       Serial.print("Frames: ");
       Serial.print(frameCount);
       Serial.print(" (last frameId ");
       Serial.print(lastFrameId);
       Serial.print(") | Updates applied: ");
       Serial.println(updatesApplied);
-      lastStats = now;
+      lastStats = statsNow;
     }
     return true;
   }
 
   uint8_t rest[RUN_HEADER_SIZE - 4];
   if (!readExactly(client, rest, sizeof(rest))) {
-    Serial.println("Failed to read run header; dropping client");
-    client.stop();
+    dropClient("Failed to read run header; dropping client");
     return false;
   }
   if (rest[0] != RUN_VERSION) {
     Serial.print("Unsupported run version: ");
     Serial.println(rest[0], HEX);
-    client.stop();
+    dropClient();
     return false;
   }
 
@@ -340,24 +546,22 @@ bool handleClient() {
     lastFrameId = frameId;
     return true;
   }
-  if (count > (DISPLAY_WIDTH * DISPLAY_HEIGHT)) {
+  if (count > (displayWidth * displayHeight)) {
     Serial.print("Run count too large: ");
     Serial.println(count);
-    client.stop();
+    dropClient();
     return false;
   }
 
   if (!ensureUpdateBuffer(count)) {
-    Serial.println("No buffer for run updates; dropping client");
-    client.stop();
+    dropClient("No buffer for run updates; dropping client");
     return false;
   }
 
   uint8_t entry[6];
   for (uint16_t i = 0; i < count; i++) {
     if (!readExactly(client, entry, sizeof(entry))) {
-      Serial.println("Stream ended mid-run frame; dropping client");
-      client.stop();
+      dropClient("Stream ended mid-run frame; dropping client");
       return false;
     }
     updateBuffer[i].y = entry[0] | (static_cast<uint16_t>(entry[1]) << 8);
@@ -368,10 +572,10 @@ bool handleClient() {
 
   tft.startWrite();
   for (uint16_t i = 0; i < count; i++) {
-    uint8_t x0 = updateBuffer[i].x;
-    uint8_t y = updateBuffer[i].y;
-    uint8_t runLen = updateBuffer[i].len;
-    if (x0 < DISPLAY_WIDTH && y < DISPLAY_HEIGHT && runLen > 0 && (x0 + runLen) <= DISPLAY_WIDTH) {
+    uint16_t x0 = updateBuffer[i].x;
+    uint16_t y = updateBuffer[i].y;
+    uint16_t runLen = updateBuffer[i].len;
+    if (x0 < displayWidth && y < displayHeight && runLen > 0 && (x0 + runLen) <= displayWidth) {
       tft.setAddrWindow(x0, y, runLen, 1);
       if (dmaEnabled) {
         tft.pushBlock(updateBuffer[i].color, runLen);
@@ -385,15 +589,15 @@ bool handleClient() {
 
   frameCount++;
   lastFrameId = frameId;
-  unsigned long now = millis();
-  if (now - lastStats > 2000) {
+  unsigned long statsNow = millis();
+  if (statsNow - lastStats > 2000) {
     Serial.print("Frames: ");
     Serial.print(frameCount);
     Serial.print(" (last frameId ");
     Serial.print(lastFrameId);
     Serial.print(") | Updates applied: ");
     Serial.println(updatesApplied);
-    lastStats = now;
+    lastStats = statsNow;
   }
 
   return true;
@@ -401,9 +605,5 @@ bool handleClient() {
 
 void loop() {
   handleClient();
-  if (client && !client.connected()) {
-    Serial.println("Client disconnected");
-    showWaitingScreen();
-  }
   delay(1);
 }

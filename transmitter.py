@@ -8,6 +8,7 @@ per-pixel updates to the ESP32 receiver using the same pixel-update protocol.
 import argparse
 import socket
 import struct
+import sys
 import time
 from typing import Optional, Sequence
 
@@ -15,6 +16,7 @@ import cv2
 import mss
 import numpy as np
 import ctypes
+from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
 try:
     from Quartz import CGEventCreate, CGEventGetLocation
@@ -27,18 +29,54 @@ class CGPoint(ctypes.Structure):
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
 
-DEFAULT_IP = "192.168.1.100"
+if sys.platform == "win32":
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+
+DEFAULT_IP = None
 DEFAULT_PORT = 8090
-PORTRAIT_WIDTH = 170
-PORTRAIT_HEIGHT = 320
-HEADER_VERSION = 0x03  # carries frame_id in header (pixels), y is uint16
+PANEL_WIDTH = 170
+PANEL_HEIGHT = 320
+HEADER_VERSION = 0x04  # carries frame_id in header; x and y are uint16
 RUN_HEADER_VERSION = 0x02  # version for run packets, y is uint16
+MDNS_SERVICE_TYPE = "_desktopmonitor._tcp.local."
+
+
+class _MDNSListener(ServiceListener):
+    def __init__(self) -> None:
+        self.match: Optional[tuple[str, int]] = None
+
+    def add_service(self, zc: Zeroconf, service_type: str, name: str) -> None:
+        if self.match is not None:
+            return
+        info = zc.get_service_info(service_type, name, timeout=2000)
+        if not info or not info.addresses:
+            return
+        ip = socket.inet_ntoa(info.addresses[0])
+        port = int(info.port)
+        self.match = (ip, port)
+
+    def remove_service(self, zc: Zeroconf, service_type: str, name: str) -> None:
+        return
+
+    def update_service(self, zc: Zeroconf, service_type: str, name: str) -> None:
+        if self.match is None:
+            self.add_service(zc, service_type, name)
 
 
 class ScreenshotPixelSender:
     def __init__(
         self,
-        ip: str,
+        ip: Optional[str],
         port: int,
         monitor_index: Optional[int],
         prefer_largest: bool,
@@ -49,6 +87,9 @@ class ScreenshotPixelSender:
         orientation: str,
         rotate_deg: int,
         show_cursor: bool,
+        region: Optional[str],
+        active_window: bool,
+        window_title: Optional[str],
     ) -> None:
         self.ip = ip
         self.port = port
@@ -60,13 +101,17 @@ class ScreenshotPixelSender:
         self.max_updates_per_frame = max_updates_per_frame
         self.orientation = orientation
         if orientation == "landscape":
-            self.display_width = PORTRAIT_HEIGHT
-            self.display_height = PORTRAIT_WIDTH
+            self.display_width = PANEL_HEIGHT
+            self.display_height = PANEL_WIDTH
         else:
-            self.display_width = PORTRAIT_WIDTH
-            self.display_height = PORTRAIT_HEIGHT
+            self.display_width = PANEL_WIDTH
+            self.display_height = PANEL_HEIGHT
         self.rotate_deg = rotate_deg
         self.show_cursor = show_cursor
+        self.region = self._parse_region(region)
+        self.active_window = active_window
+        self.window_title = window_title
+        self.window_title_lower = window_title.lower() if window_title else None
 
         self.sock: Optional[socket.socket] = None
         self.prev_rgb: Optional[np.ndarray] = None  # (H, W, 3) uint8
@@ -74,10 +119,26 @@ class ScreenshotPixelSender:
         self.frame_id: int = 0
         self.monitor: Optional[dict] = None
         self.sct: Optional[mss.mss] = None
+        self.capture_mode = "monitor"
         self.cursor_warned: bool = False
         self.cursor_backend: Optional[tuple[str, Optional[ctypes.CDLL]]] = (
             self._init_cursor_backend()
         )
+        self.user32 = None
+        if sys.platform == "win32":
+            self.user32 = ctypes.windll.user32
+
+    @staticmethod
+    def _parse_region(region: Optional[str]) -> Optional[dict]:
+        if not region:
+            return None
+        parts = [p.strip() for p in region.split(",")]
+        if len(parts) != 4:
+            raise ValueError("region must be x,y,width,height")
+        left, top, width, height = (int(p) for p in parts)
+        if width <= 0 or height <= 0:
+            raise ValueError("region width and height must be > 0")
+        return {"left": left, "top": top, "width": width, "height": height}
 
     def _init_cursor_backend(self) -> Optional[tuple[str, Optional[ctypes.CDLL]]]:
         # Prefer Quartz if available (pyobjc); otherwise fall back to CoreGraphics via ctypes
@@ -95,12 +156,38 @@ class ScreenshotPixelSender:
             return None
 
     # Connection helpers -------------------------------------------------
+    def discover_device(self, timeout: float = 3.0) -> bool:
+        print(f"[DISCOVERY] Searching for {MDNS_SERVICE_TYPE}")
+        zc = Zeroconf()
+        listener = _MDNSListener()
+        ServiceBrowser(zc, MDNS_SERVICE_TYPE, listener)
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                if listener.match is not None:
+                    self.ip, self.port = listener.match
+                    print(f"[DISCOVERY] Found {self.ip}:{self.port}")
+                    return True
+                time.sleep(0.1)
+        finally:
+            zc.close()
+        print("[DISCOVERY] No device found via mDNS")
+        return False
+
     def ensure_connection(self) -> bool:
         if self.sock:
             return True
         return self.connect()
 
+    def send_orientation(self) -> None:
+        if not self.sock:
+            return
+        rotation = 1 if self.orientation == "landscape" else 0
+        self.sock.sendall(b"PXOR" + bytes([1, rotation]))
+
     def connect(self, retries: int = 3) -> bool:
+        if not self.ip and not self.discover_device():
+            return False
         for attempt in range(1, retries + 1):
             try:
                 if self.sock:
@@ -110,6 +197,7 @@ class ScreenshotPixelSender:
                 self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.settimeout(10)
                 self.sock.connect((self.ip, self.port))
+                self.send_orientation()
                 print("[CONNECT] ✓ Connected")
                 return True
             except Exception as exc:  # noqa: BLE001
@@ -125,6 +213,74 @@ class ScreenshotPixelSender:
         print("[CONNECT] Disconnected")
 
     # Monitor helpers ----------------------------------------------------
+    def _is_window_capture(self) -> bool:
+        return self.active_window or self.window_title_lower is not None
+
+    def _get_window_rect(self, hwnd: int) -> Optional[dict]:
+        if not self.user32 or not hwnd:
+            return None
+        rect = RECT()
+        if not self.user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+            return None
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width <= 0 or height <= 0:
+            return None
+        return {
+            "left": int(rect.left),
+            "top": int(rect.top),
+            "width": width,
+            "height": height,
+        }
+
+    def _find_active_window_region(self) -> Optional[dict]:
+        if not self.user32:
+            print("[WIN] --active-window is currently supported on Windows only")
+            return None
+        hwnd = self.user32.GetForegroundWindow()
+        return self._get_window_rect(int(hwnd))
+
+    def _find_window_title_region(self) -> Optional[dict]:
+        if not self.user32 or not self.window_title_lower:
+            return None
+
+        matches: list[int] = []
+
+        def enum_proc(hwnd: int, _lparam: int) -> bool:
+            if not self.user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
+                return True
+            length = self.user32.GetWindowTextLengthW(ctypes.c_void_p(hwnd))
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            self.user32.GetWindowTextW(ctypes.c_void_p(hwnd), buffer, length + 1)
+            title = buffer.value.strip()
+            if title and self.window_title_lower in title.lower():
+                matches.append(int(hwnd))
+                return False
+            return True
+
+        self.user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
+        if not matches:
+            print(f"[WIN] No visible window found matching title: {self.window_title}")
+            return None
+        return self._get_window_rect(matches[0])
+
+    def _resolve_capture_region(self) -> Optional[dict]:
+        if self.region is not None:
+            self.capture_mode = "region"
+            return dict(self.region)
+        if self.active_window:
+            self.capture_mode = "active-window"
+            return self._find_active_window_region()
+        if self.window_title_lower is not None:
+            self.capture_mode = "window-title"
+            return self._find_window_title_region()
+        self.capture_mode = "monitor"
+        return self._select_monitor(
+            self.sct.monitors, self.monitor_index, self.prefer_largest
+        )
+
     @staticmethod
     def _select_monitor(
         monitors: Sequence[dict],
@@ -162,22 +318,31 @@ class ScreenshotPixelSender:
             print(f"[MON] Unable to start screen capture: {exc}")
             return False
 
-        monitor = self._select_monitor(
-            self.sct.monitors, self.monitor_index, self.prefer_largest
-        )
+        monitor = self._resolve_capture_region()
         if not monitor:
-            print("[MON] No monitor selected or available")
+            print("[MON] No capture region selected or available")
             return False
 
         self.monitor = monitor
         print(
-            f"[MON] Using monitor at ({monitor['left']}, {monitor['top']}) "
-            f"{monitor['width']}x{monitor['height']}"
+            f"[MON] Using {self.capture_mode} at ({monitor['left']}, {monitor['top']}) {monitor['width']}x{monitor['height']}"
         )
+        return True
+
+    def refresh_capture_region(self) -> bool:
+        if not self._is_window_capture():
+            return True
+        region = self._resolve_capture_region()
+        if not region:
+            print("[MON] Unable to resolve target window")
+            return False
+        self.monitor = region
         return True
 
     def grab_frame(self) -> Optional[np.ndarray]:
         if not self.sct or not self.monitor:
+            return None
+        if not self.refresh_capture_region():
             return None
         try:
             shot = self.sct.grab(self.monitor)
@@ -340,9 +505,13 @@ class ScreenshotPixelSender:
             self.frame_id += 1
             return packets
 
+        pixel_packets = self._build_pixel_packets(xs, ys, colors, count)
+        if self.display_width > 255:
+            self.frame_id += len(pixel_packets)
+            return pixel_packets
+
         # Try run-length encoding by rows; choose smaller payload
         run_packets = self._build_run_packets(mask, rgb565)
-        pixel_packets = self._build_pixel_packets(xs, ys, colors, count)
 
         run_bytes = sum(len(p) for p in run_packets)
         pixel_bytes = sum(len(p) for p in pixel_packets)
@@ -370,7 +539,7 @@ class ScreenshotPixelSender:
             payload = bytearray(header)
             append = payload.extend
             for x, y, color in zip(xs[start:end], ys[start:end], colors[start:end]):
-                append(struct.pack("<BHH", int(x), int(y), int(color)))
+                append(struct.pack("<HHH", int(x), int(y), int(color)))
             packets.append(bytes(payload))
             start = end
         return packets
@@ -529,7 +698,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Capture a monitor and send per-pixel updates to ESP32"
     )
-    parser.add_argument("--ip", type=str, default=DEFAULT_IP, help="ESP32 IP")
+    parser.add_argument(
+        "--ip",
+        type=str,
+        default=DEFAULT_IP,
+        help="ESP32 IP; if omitted, discover via mDNS",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT, help="TCP port (default 8090)"
     )
@@ -571,8 +745,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--orientation",
         type=str,
         choices=["portrait", "landscape"],
-        default="portrait",
-        help="Target display orientation: portrait=170x320, landscape=320x170",
+        default="landscape",
+        help="Target display orientation: landscape=320x170, portrait=170x320",
     )
     parser.add_argument(
         "--rotate",
@@ -585,6 +759,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--show-cursor",
         action="store_true",
         help="Draw the cursor location onto the captured frame (requires Quartz/pyobjc on macOS)",
+    )
+    capture_group = parser.add_mutually_exclusive_group()
+    capture_group.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        help="Capture a screen region as x,y,width,height",
+    )
+    capture_group.add_argument(
+        "--active-window",
+        action="store_true",
+        help="Capture the currently focused window (Windows)",
+    )
+    capture_group.add_argument(
+        "--window-title",
+        type=str,
+        default=None,
+        help="Capture the first visible window whose title contains this text (Windows)",
     )
     return parser.parse_args(argv)
 
@@ -603,6 +795,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         orientation=args.orientation,
         rotate_deg=args.rotate,
         show_cursor=args.show_cursor,
+        region=args.region,
+        active_window=args.active_window,
+        window_title=args.window_title,
     )
     sender.run()
 
