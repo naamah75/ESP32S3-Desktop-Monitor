@@ -1,6 +1,6 @@
-# ESP32 Desktop Monitor - LilyGo T-Display-S3
+# ESP32S3-Desktop-Monitor
 
-Questa versione e' adattata per **LilyGo T-Display-S3** con **ESP32-S3** e display **ST7789 1.9" 170x320**.
+Fork del progetto `ESP32-Desktop-Monitor`, adattato per **LilyGo T-Display-S3** con **ESP32-S3** e display **ST7789 1.9" 170x320**.
 
 ## Struttura
 
