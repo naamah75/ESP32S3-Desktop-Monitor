@@ -1,20 +1,20 @@
 # ESP32S3-Desktop-Monitor
 
-Fork del progetto `ESP32-Desktop-Monitor`, adattato per **LilyGo T-Display-S3** con **ESP32-S3** e display **ST7789 1.9" 170x320**.
+Fork of `ESP32-Desktop-Monitor`, adapted for **LilyGo T-Display-S3** with **ESP32-S3** and a **1.9" ST7789 170x320** display.
 
-## Struttura
+## Structure
 
-- `platformio.ini` → configurazione PlatformIO
-- `src/main.cpp` → sketch convertito
-- `include/WifiConfig.h` → fallback pubblico e opzioni setup Wi-Fi
-- `include/WifiConfig.local.h` → credenziali locali non tracciate
-- `include/TFTConfig.h` → risoluzione, rotazione e pin aggiuntivi
-- `transmitter.py` → sender Python aggiornato
-- `requirements.txt` → dipendenze Python
+- `platformio.ini` -> PlatformIO configuration
+- `src/main.cpp` -> converted receiver sketch
+- `include/WifiConfig.h` -> public-safe Wi-Fi fallback and setup options
+- `include/WifiConfig.local.h` -> local untracked Wi-Fi credentials
+- `include/TFTConfig.h` -> panel resolution, rotation, and extra pins
+- `transmitter.py` -> updated Python sender
+- `requirements.txt` -> Python dependencies
 
-## Note importanti
+## Important Notes
 
-Questa configurazione assume il pinout ufficiale **LilyGo T-Display-S3**:
+This configuration assumes the official **LilyGo T-Display-S3** pinout:
 
 - CS = 6
 - DC = 7
@@ -25,101 +25,101 @@ Questa configurazione assume il pinout ufficiale **LilyGo T-Display-S3**:
 - BL = 38
 - POWER = 15
 
-Se la tua board usa una revisione diversa, modifica `platformio.ini` e `include/TFTConfig.h`.
+If your board uses a different revision, adjust `platformio.ini` and `include/TFTConfig.h`.
 
-## Differenza importante rispetto alla versione 135x240
+## Important Difference From The 135x240 Version
 
-Il progetto originale usava coordinate display a 8 bit. Su `170x320` e in `landscape 320x170` non bastano per indirizzare tutto il pannello, quindi receiver e sender sono stati aggiornati a un protocollo nuovo:
+The original project used 8-bit display coordinates. On `170x320`, and in `landscape 320x170`, that is not enough to address the full panel, so both the receiver and sender were updated to a newer protocol:
 
-- pacchetti `PXUP` versione `0x04`
-- pacchetti `PXUR` versione `0x02`
-- coordinate `x` e `y` a 16 bit little-endian nei pacchetti pixel
-- pacchetto `PXOR` per sincronizzare la rotazione runtime del display
+- `PXUP` packets version `0x04`
+- `PXUR` packets version `0x02`
+- `x` and `y` coordinates are 16-bit little-endian in pixel packets
+- `PXOR` packet to synchronize runtime display rotation
 
-Questa versione del firmware richiede quindi anche il `transmitter.py` incluso in questa cartella.
+This firmware therefore requires the `transmitter.py` included in this repository.
 
-## Wi-Fi e captive portal
+## Wi-Fi And Captive Portal
 
-Il firmware supporta tre modalita' di avvio Wi-Fi:
+The firmware supports three Wi-Fi startup modes:
 
-- usa le credenziali fallback di `include/WifiConfig.local.h` o `include/WifiConfig.h`
-- se non funzionano, prova le credenziali salvate in flash
-- se non riesce a collegarsi, apre un captive portal
+- use fallback credentials from `include/WifiConfig.local.h` or `include/WifiConfig.h`
+- if those fail, try credentials saved in flash
+- if it still cannot connect, open a captive portal
 
 Captive portal:
 
 - AP: `ESP32S3-Monitor-Setup`
 - URL: `http://192.168.4.1`
-- pulsante setup: `IO14` tenuto basso al boot
+- setup button: `IO14`, held low during boot
 
-Forzatura software del portal:
+Software-forced portal:
 
 ```cpp
 #define FORCE_WIFI_SETUP 1
 ```
 
-Configurazione consigliata per GitHub:
+Recommended GitHub-safe setup:
 
-- lascia `include/WifiConfig.h` con placeholder pubblici
-- salva le credenziali vere in `include/WifiConfig.local.h`
-- `include/WifiConfig.local.h` e' ignorato da git
+- keep public placeholders in `include/WifiConfig.h`
+- store real credentials in `include/WifiConfig.local.h`
+- `include/WifiConfig.local.h` is gitignored
 
-## Come usare
+## Usage
 
-1. Apri la cartella in VS Code con PlatformIO.
-2. Se vuoi un fallback locale, crea o aggiorna `include/WifiConfig.local.h` con SSID e password.
-3. Compila e carica sull'ambiente `t-display-s3`.
-4. Apri il monitor seriale a 115200 baud.
-5. Installa le dipendenze Python sul PC:
+1. Open the folder in VS Code with PlatformIO.
+2. If you want a local fallback, create or update `include/WifiConfig.local.h` with your SSID and password.
+3. Build and upload the `t-display-s3` environment.
+4. Open the serial monitor at 115200 baud.
+5. Install Python dependencies on the PC:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-6. Avvia `transmitter.py` dal PC.
+6. Start `transmitter.py` on the PC.
 
-Esempio:
+Example:
 
 ```bash
 python transmitter.py
 ```
 
-Se non passi `--ip`, il sender cerca automaticamente il device via mDNS usando `_desktopmonitor._tcp.local`.
+If you do not pass `--ip`, the sender automatically discovers the device via mDNS using `_desktopmonitor._tcp.local`.
 
-## Orientamento display
+## Display Orientation
 
-L'orientamento del firmware si imposta in `include/TFTConfig.h`:
+Firmware orientation is configured in `include/TFTConfig.h`:
 
 ```cpp
 // 0 = portrait, 1 = landscape, 2 = portrait inverted, 3 = landscape inverted
 #define DISPLAY_ROTATION 0
 ```
 
-Per mantenere coerente anche lo stream dal PC, usa la stessa orientazione in `transmitter.py`:
+To keep the PC stream consistent with the display, use the same orientation in `transmitter.py`:
 
 ```bash
 python transmitter.py --orientation portrait
 python transmitter.py --orientation landscape
 ```
 
-Nota:
+Notes:
 
-- `landscape` e' il default del sender
-- `--orientation` cambia la risoluzione target del display e invia anche la rotazione runtime al firmware
-- `--rotate` ruota il contenuto catturato prima del resize
+- `landscape` is the sender default
+- `--orientation` changes the target display resolution and also sends runtime rotation to the firmware
+- `--rotate` rotates the captured content before resize
 
-## Modalita' di cattura del sender
+## Sender Capture Modes
 
-Il sender supporta:
+The sender supports:
 
-- monitor intero
-- monitor specifico con `--monitor-index`
-- monitor piu' grande con `--prefer-largest`
-- finestra attiva con `--active-window` (Windows)
-- finestra per titolo con `--window-title "Titolo"` (Windows)
-- regione con `--region x,y,width,height`
+- full monitor capture
+- specific monitor with `--monitor-index`
+- largest monitor with `--prefer-largest`
+- active window with `--active-window` (Windows)
+- window title match with `--window-title "Title"` (Windows)
+- fixed region with `--region x,y,width,height`
 
-Esempi:
+Examples:
 
 ```bash
 python transmitter.py --active-window
@@ -127,21 +127,21 @@ python transmitter.py --window-title "Visual Studio Code"
 python transmitter.py --region 100,100,800,600
 ```
 
-Le opzioni `--region`, `--active-window` e `--window-title` sono mutuamente esclusive.
+The options `--region`, `--active-window`, and `--window-title` are mutually exclusive.
 
 ## mDNS
 
-Il firmware pubblica:
+The firmware publishes:
 
 - hostname: `esp32s3-monitor.local`
 - service: `_desktopmonitor._tcp.local`
-- porta: `8090`
+- port: `8090`
 
-Il sender usa `zeroconf` per trovare automaticamente il device in LAN.
+The sender uses `zeroconf` to discover the device automatically on the LAN.
 
-## Configurazione pannello
+## Panel Configuration
 
-La risoluzione nativa del pannello e alcuni pin aggiuntivi sono configurabili in `include/TFTConfig.h`:
+The native panel resolution and some extra pins are configurable in `include/TFTConfig.h`:
 
 ```cpp
 #define TFT_PANEL_WIDTH 170
@@ -150,9 +150,9 @@ La risoluzione nativa del pannello e alcuni pin aggiuntivi sono configurabili in
 #define SETUP_BUTTON_PIN 14
 ```
 
-Questa configurazione e' pensata per il pannello ST7789V `170x320` della T-Display-S3, ma puo' essere adattata a pannelli compatibili con la stessa libreria se anche pin, offset e ordine colori sono coerenti.
+This configuration targets the T-Display-S3 `170x320` ST7789V panel, but it can be adapted to compatible panels using the same library if the pin mapping, offsets, and color order also match.
 
-## Comandi utili
+## Useful Commands
 
 ```bash
 pio run
@@ -162,16 +162,16 @@ pip install -r requirements.txt
 python transmitter.py --help
 ```
 
-## Se il display non va
+## If The Display Does Not Work
 
-Le cause classiche sono:
+Typical causes are:
 
-1. board o pin mapping non coerenti con la tua revisione
-2. alimentazione display non abilitata (`GPIO15`)
-3. ordine colori
+1. board or pin mapping does not match your hardware revision
+2. display power is not enabled (`GPIO15`)
+3. wrong color order
 
-In quel caso puoi:
+In that case you can:
 
-- provare `TFT_RGB_ORDER=TFT_BGR`
-- verificare che `GPIO15` venga portato `HIGH`
-- verificare i pin della tua board
+- try `TFT_RGB_ORDER=TFT_BGR`
+- verify that `GPIO15` is driven `HIGH`
+- verify your board pin mapping
